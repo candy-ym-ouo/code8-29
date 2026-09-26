@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import {
+  changePasswordAndRotateSessions,
   createSession,
   currentUser,
   deleteCurrentSession,
@@ -110,11 +111,10 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     const valid = await verifyPassword(user.passwordHash, parsed.data.currentPassword);
     if (!valid) throw new AppError(422, 'INVALID_PASSWORD', '当前密码不正确');
 
-    await prisma.user.update({
-      where: { id: authUser.id },
-      data: { passwordHash: await hashPassword(parsed.data.newPassword) }
-    });
-    await createSession(authUser.id, reply, true);
+    // 哈希计算耗时较长，先在事务外完成；密码更新与会话轮换由
+    // changePasswordAndRotateSessions 在同一个事务中提交，失败可安全重试。
+    const newPasswordHash = await hashPassword(parsed.data.newPassword);
+    await changePasswordAndRotateSessions(authUser.id, newPasswordHash, reply);
     return { ok: true };
   });
 

@@ -29,22 +29,11 @@ export async function verifyPassword(passwordHash: string, password: string): Pr
   }
 }
 
-export async function createSession(
-  userId: string,
-  reply: FastifyReply,
-  rotateOthers = false
-): Promise<void> {
-  const token = randomBytes(32).toString('base64url');
-  const expiresAt = new Date(Date.now() + env.SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
-  if (rotateOthers) {
-    await prisma.session.updateMany({
-      where: { userId, revokedAt: null },
-      data: { revokedAt: new Date() }
-    });
-  }
-  await prisma.session.create({
-    data: { userId, tokenHash: tokenHash(token), expiresAt }
-  });
+function sessionExpiry(): Date {
+  return new Date(Date.now() + env.SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
+}
+
+function setSessionCookie(reply: FastifyReply, token: string): void {
   reply.setCookie(SESSION_COOKIE, token, {
     path: '/',
     httpOnly: true,
@@ -52,6 +41,43 @@ export async function createSession(
     sameSite: 'lax',
     maxAge: env.SESSION_TTL_DAYS * 24 * 60 * 60
   });
+}
+
+export async function createSession(userId: string, reply: FastifyReply): Promise<void> {
+  const token = randomBytes(32).toString('base64url');
+  await prisma.session.create({
+    data: { userId, tokenHash: tokenHash(token), expiresAt: sessionExpiry() }
+  });
+  setSessionCookie(reply, token);
+}
+
+/**
+ * 修改密码并轮换会话。密码更新、作废旧会话、签发新会话必须在同一个事务里
+ * 提交：任何一步失败都会整体回滚，旧密码和旧会话保持有效，客户端可以直接
+ * 重试，不会留下"密码已改但所有会话已失效"的半完成状态。Cookie 只在事务
+ * 提交成功后写入。
+ */
+export async function changePasswordAndRotateSessions(
+  userId: string,
+  passwordHash: string,
+  reply: FastifyReply
+): Promise<void> {
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = sessionExpiry();
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({
+      where: { id: userId },
+      data: { passwordHash }
+    });
+    await tx.session.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() }
+    });
+    await tx.session.create({
+      data: { userId, tokenHash: tokenHash(token), expiresAt }
+    });
+  });
+  setSessionCookie(reply, token);
 }
 
 export async function deleteCurrentSession(request: FastifyRequest, reply: FastifyReply): Promise<void> {
