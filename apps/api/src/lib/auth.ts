@@ -29,22 +29,11 @@ export async function verifyPassword(passwordHash: string, password: string): Pr
   }
 }
 
-export async function createSession(
-  userId: string,
-  reply: FastifyReply,
-  rotateOthers = false
-): Promise<void> {
-  const token = randomBytes(32).toString('base64url');
-  const expiresAt = new Date(Date.now() + env.SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
-  if (rotateOthers) {
-    await prisma.session.updateMany({
-      where: { userId, revokedAt: null },
-      data: { revokedAt: new Date() }
-    });
-  }
-  await prisma.session.create({
-    data: { userId, tokenHash: tokenHash(token), expiresAt }
-  });
+function sessionExpiresAt(): Date {
+  return new Date(Date.now() + env.SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
+}
+
+function setSessionCookie(reply: FastifyReply, token: string): void {
   reply.setCookie(SESSION_COOKIE, token, {
     path: '/',
     httpOnly: true,
@@ -52,6 +41,56 @@ export async function createSession(
     sameSite: 'lax',
     maxAge: env.SESSION_TTL_DAYS * 24 * 60 * 60
   });
+}
+
+export async function createSession(
+  userId: string,
+  reply: FastifyReply,
+  rotateOthers = false
+): Promise<void> {
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = sessionExpiresAt();
+  await prisma.$transaction(async (tx) => {
+    if (rotateOthers) {
+      await tx.session.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date() }
+      });
+    }
+    await tx.session.create({
+      data: { userId, tokenHash: tokenHash(token), expiresAt }
+    });
+  });
+  setSessionCookie(reply, token);
+}
+
+/**
+ * 修改密码并轮换会话：密码更新、吊销全部旧会话、签发新会话在同一事务中提交。
+ * 任一步骤失败都会整体回滚——旧密码与旧会话保持不变，客户端可直接重试，
+ * 不会出现"旧登录已失效、新会话未签发"的半完成状态。
+ */
+export async function rotatePasswordAndSession(
+  userId: string,
+  newPasswordHash: string,
+  reply: FastifyReply
+): Promise<void> {
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = sessionExpiresAt();
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({
+      where: { id: userId },
+      data: { passwordHash: newPasswordHash }
+    });
+    await tx.session.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() }
+    });
+    await tx.session.create({
+      data: { userId, tokenHash: tokenHash(token), expiresAt }
+    });
+  });
+  // 事务提交成功后才下发新会话 Cookie；失败时客户端仍持有有效的旧会话
+  setSessionCookie(reply, token);
 }
 
 export async function deleteCurrentSession(request: FastifyRequest, reply: FastifyReply): Promise<void> {

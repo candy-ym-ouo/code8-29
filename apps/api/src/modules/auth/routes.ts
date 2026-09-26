@@ -8,6 +8,7 @@ import {
   deleteCurrentSession,
   hashPassword,
   requireAuth,
+  rotatePasswordAndSession,
   verifyPassword
 } from '../../lib/auth.js';
 
@@ -110,11 +111,10 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     const valid = await verifyPassword(user.passwordHash, parsed.data.currentPassword);
     if (!valid) throw new AppError(422, 'INVALID_PASSWORD', '当前密码不正确');
 
-    await prisma.user.update({
-      where: { id: authUser.id },
-      data: { passwordHash: await hashPassword(parsed.data.newPassword) }
-    });
-    await createSession(authUser.id, reply, true);
+    // argon2 哈希较慢，在事务外预先计算，避免拉长事务持有时间；
+    // 密码更新 + 会话轮换由 rotatePasswordAndSession 在同一事务中完成，失败可安全重试
+    const newPasswordHash = await hashPassword(parsed.data.newPassword);
+    await rotatePasswordAndSession(authUser.id, newPasswordHash, reply);
     return { ok: true };
   });
 
